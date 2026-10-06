@@ -23,7 +23,7 @@ from .models import (
     ServiceRef,
     TimeChange,
 )
-from .scheduler import SolveResult, solve
+from .scheduler import AlternativesResult, SolveResult, solve, solve_alternatives
 from .validator import Normalized, validate_and_normalize
 
 
@@ -35,12 +35,16 @@ class RunOutcome:
     - norm 非空且求解可行；
     - validation_errors 非空：输入错误（422）；
     - blockers 非空且 status 为 infeasible/unknown：无解/超时。
+
+    启用备选（alternative_count）时 alternatives 非空；result 始终映射为首项，
+    因此差异预演等“只看首项”的调用方无需感知备选模式。
     """
 
     norm: Normalized | None = None
     result: SolveResult | None = None
     validation_errors: list[dict] | None = None
     empty: bool = False
+    alternatives: AlternativesResult | None = None
 
     @property
     def feasible(self) -> bool:
@@ -55,6 +59,17 @@ def run_request(req: ScheduleRequest) -> RunOutcome:
     norm, errors = validate_and_normalize(req)
     if errors:
         return RunOutcome(validation_errors=errors)
+
+    if norm.alternative_count is not None:
+        alt = solve_alternatives(norm)
+        # 首项映射为普通 SolveResult：备选模式的首项必须已证明 OPTIMAL。
+        if alt.feasible:
+            first = SolveResult(True, alt.first_status, alt.starts[0], None)
+        elif alt.status == "infeasible":
+            first = SolveResult(False, "infeasible", None, alt.blockers)
+        else:
+            first = SolveResult(False, "unknown", None, alt.blockers)
+        return RunOutcome(norm=norm, result=first, alternatives=alt)
 
     return RunOutcome(norm=norm, result=solve(norm))
 

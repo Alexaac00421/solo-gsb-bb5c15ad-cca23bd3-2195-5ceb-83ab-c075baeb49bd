@@ -69,7 +69,9 @@ class Normalized:
     capacity_periods: dict[str, list[CapacityPeriod]]  # 资源 -> 临时容量时段（按开始时刻排序，互不重叠）
     pinned_starts: dict[str, int]  # 已确认服务 -> 锁定部署开始时刻（UTC epoch 秒）
     reference_starts: dict[str, int]  # 给出参考时刻的服务 -> 参考部署开始时刻（UTC epoch 秒）
-    max_solve_seconds: float
+    alternative_count: int | None = None  # 备选方案数量（1～5）；None 表示不启用备选（旧行为）
+    alternative_gap: int = 60  # 备选互异最小差距（秒，正整数）；启用备选且省略时默认 60s
+    max_solve_seconds: float = 10.0
 
 
 def _iso(ts: int) -> str:
@@ -323,6 +325,32 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
                        "message": f"服务 {sid} 同时列入 pinned_starts 与 reference_starts："
                                   "已确认锁定的服务不能再给出参考时刻（两类互斥）"})
 
+    # 9) 备选方案：alternative_count（1～5）与 alternative_gap_minutes（正整数分钟）。
+    #    两个字段均省略时沿用旧行为（只返回单个排程）；只给差距而不给数量没有可执行语义，按 422 拒绝。
+    raw_count, raw_gap = req.alternative_count, req.alternative_gap_minutes
+    alt_count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) else None
+    if raw_count is not None and (alt_count is None or not 1 <= alt_count <= 5):
+        errors.append({"code": "bad_alternative_count",
+                       "field": "alternative_count",
+                       "message": f"备选方案数量必须为 1～5 的整数（实际: {raw_count}）；"
+                                  "省略该字段时只返回单个排程（旧行为）"})
+        alt_count = None
+
+    alt_gap_seconds = 60  # 启用备选且省略差距时默认 1 分钟
+    if raw_gap is not None:
+        if isinstance(raw_gap, int) and not isinstance(raw_gap, bool) and raw_gap > 0:
+            alt_gap_seconds = raw_gap * 60
+        else:
+            errors.append({"code": "bad_alternative_gap",
+                           "field": "alternative_gap_minutes",
+                           "message": f"备选方案最小差距必须为正整数分钟（实际: {raw_gap}）；"
+                                      "启用备选而省略本字段时默认 1 分钟"})
+    if raw_gap is not None and raw_count is None:
+        errors.append({"code": "alternative_gap_without_count",
+                       "field": "alternative_gap_minutes",
+                       "message": "给出 alternative_gap_minutes 时必须同时给出 1～5 的 "
+                                  "alternative_count；仅给最小差距无法确定备选方案数量"})
+
     if dst_issues or errors:
         return None, dst_issues + errors
 
@@ -336,6 +364,8 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         capacity_periods=capacity_periods,
         pinned_starts=pinned_starts,
         reference_starts=reference_starts,
+        alternative_count=alt_count,
+        alternative_gap=alt_gap_seconds,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 

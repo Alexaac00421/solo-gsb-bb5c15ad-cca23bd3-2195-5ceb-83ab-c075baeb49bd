@@ -225,6 +225,111 @@ modified 新增 `pinned_starts`，差异会体现在被移动的服务上；modi
 （infeasible/unknown）或输入错误（422）时，仍只在 `failures.modified` 给出含 `lock:` 条件的
 阻塞组合 / 完整错误列表，`diff` 为 `null`。
 
+### 发布评审备选时序：一次请求返回多个可执行方案（本轮新增）
+
+发布评审往往需要对**同一份请求**横向比较多个可执行时序。请求体新增两个**可选**字段：
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `alternative_count` | `1`～`5` 的整数 | 希望返回的备选方案数量；**省略或传 `null` 时完全沿用旧行为**（只返回单个排程，响应 JSON 不含任何备选相关键） |
+| `alternative_gap_minutes` | 正整数分钟 | 方案之间的**最小差距**；仅在给出 `alternative_count` 时生效，启用备选而省略时默认为 **1 分钟** |
+
+方案生成规则（逐项迭代，每一步都重新完整建模求解）：
+
+1. **首项**与旧行为采用完全相同的目标：无 `reference_starts` 时最小化部署开始时刻之和
+   （尽早发布）；有 `reference_starts` 时沿用"偏离服务数 → 偏移总时长 → 尽早发布"三层
+   词典序目标。响应中的 `schedule` 始终就是首项。
+2. **后续每项**都必须满足全部候选窗、依赖先后、团队禁发、维护冻结、共享资源容量
+   （含临时容量时段）与锁定等式约束——任何一项都不豁免；此外相对**此前每一个方案**，
+   至少有一个**未锁定服务**的**部署开始 UTC 时刻**相差达到 `alternative_gap_minutes`
+   （`|开始时刻之差| ≥ gap`，早于或晚于都算）。已锁定服务的开始时刻是硬等式，
+   **不参与**互异判定。
+3. 每个后续项都在"与此前所有方案互异"的前提下，按**与首项相同的目标**重新择优，
+   因此返回的方案天然按同一偏好排序（同样尽早、同样贴合参考时刻），越靠前越优。
+4. 全部方案求解共享同一个 `max_solve_seconds` 时限。
+
+互异约束的编码：对每个此前方案 P 与每个未锁定服务 i 建布尔量
+`b_i ⟺ start_i − P_i ≥ gap`（否则 `P_i − start_i ≥ gap`），并要求 `∨_i b_i`；
+锁定服务不在该析取中。
+
+**完成状态 `alternatives_status`**：
+
+| 状态 | 含义 |
+|---|---|
+| `complete` | 已凑够 `alternative_count` 个**已验证最优**的完整方案 |
+| `exhausted` | 求解器已**证明**不存在更多满足互异约束的可行方案（最后一次迭代返回 INFEASIBLE）；`alternatives` 中是全部存在的方案，数量可能少于请求值 |
+| `unknown` | 求解超时：**已验证的方案照常返回**（在 `alternatives` 中），但未能判定后续是否还有方案——绝不误报 `exhausted`，也绝不返回未证明最优的方案；可增大 `max_solve_seconds` 后重试 |
+
+边界与失败语义（与单解接口一致）：
+
+- **全部服务锁定时没有可互异的维度，至多返回首项**：首项之后直接 `exhausted`。
+- 首项 **INFEASIBLE**：沿用现有阻塞组合（`blockers`，含窗口/冻结/禁发/资源/依赖/
+  `lock:` 假设），`feasible=false`、`schedule=null`、`alternatives=null`、
+  `alternatives_status="infeasible"`，**不返回任何部分排程**。
+- 首项或任一层在时限内**未能证明最优**：返回 200、`status="unknown"`，
+  首项未验证时 `alternatives=null`；已有已验证方案时这些方案保留、
+  `alternatives_status="unknown"`。超时**绝不会**被报成 `exhausted`。
+- 备选模式下每个方案都必须证明 **OPTIMAL**（无参考时刻的单解接口允许返回未证明最优的
+  FEASIBLE 解，但备选模式不采纳未验证方案）。
+- `/api/schedule/diff` 的两侧请求也可携带备选字段并各自独立求解，但**差异预演仍只
+  比较各侧首项**（与未启用备选时完全一致）；某侧首项无解/超时/输入非法时的失败语义
+  不变（`failures.<side>`，输入错误仍整体 422）。
+
+**输入错误（422，沿用 `errors[].code/field/message` 结构）**：
+
+| 情形 | 错误码 | field |
+|---|---|---|
+| `alternative_count` 不在 1～5（含 0、负数、非整数） | `bad_alternative_count` | `alternative_count` |
+| `alternative_gap_minutes` 不是正整数（0、负数） | `bad_alternative_gap` | `alternative_gap_minutes` |
+| 只给差距、没给数量 | `alternative_gap_without_count` | `alternative_gap_minutes` |
+
+调用示例（curl）：两个服务共享容量 1 的 `db`，一次要 3 个间隔至少 30 分钟的方案：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id":"a","name":"服务 A","timezone":"UTC",
+       "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]},
+      {"id":"b","name":"服务 B","timezone":"UTC",
+       "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]}
+    ],
+    "resource_capacities": {"db": 1},
+    "alternative_count": 3,
+    "alternative_gap_minutes": 30
+  }'
+```
+
+响应（节选）：首项 `a@00:00 / b@01:00`（尽早和最小），后续按同一目标逐项择优且两两互异，
+`alternatives_status` 为 `complete`；若请求数量超过实际存在的方案数则为 `exhausted`。
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "schedule": [ { "service_id": "a", "deploy_start_utc": "2026-12-01T00:00:00+00:00", "...": "..." },
+                { "service_id": "b", "deploy_start_utc": "2026-12-01T01:00:00+00:00", "...": "..." } ],
+  "blockers": null,
+  "alternatives": [
+    [ { "service_id": "a", "deploy_start_utc": "2026-12-01T00:00:00+00:00", "...": "..." },
+      { "service_id": "b", "deploy_start_utc": "2026-12-01T01:00:00+00:00", "...": "..." } ],
+    [ { "service_id": "b", "deploy_start_utc": "2026-12-01T00:00:00+00:00", "...": "..." },
+      { "service_id": "a", "deploy_start_utc": "2026-12-01T01:00:00+00:00", "...": "..." } ],
+    [ { "service_id": "a", "deploy_start_utc": "2026-12-01T00:30:00+00:00", "...": "..." },
+      { "service_id": "b", "deploy_start_utc": "2026-12-01T01:30:00+00:00", "...": "..." } ]
+  ],
+  "alternatives_status": "complete"
+}
+```
+
+> `alternatives` 的每个元素都是与 `schedule` 同构的**完整方案**（全部服务的部署开始/
+> 结束、占用结束、本地时间、命中窗口与资源），`alternatives[0]` 恒等于 `schedule`。
+> 省略 `alternative_count` 时响应中**不出现** `alternatives` 与 `alternatives_status` 两个键，
+> 旧客户端逐字段兼容。
+
 时间串支持两种写法：
 
 - **墙上时间 + 时区字段**：`"2026-11-13T22:00"` + `"timezone": "Europe/Berlin"`，按该时区解释，参与 DST 检查；
@@ -533,8 +638,8 @@ app/
   models.py      请求/响应 Pydantic 模型
   times.py       时区解析与 DST 重复/不存在分类（zoneinfo fold 规则）
   validator.py   输入校验：DST、引用完整性、依赖环检测、区间合法性
-  scheduler.py   CP-SAT 建模、求解、不可行假设核（blocking core）提取
-  diff.py        变更影响预演：双请求执行与按服务 ID 的时刻对齐求差
+  scheduler.py   CP-SAT 建模、求解、不可行假设核（blocking core）提取、备选时序逐项互异择优
+  diff.py        变更影响预演：双请求执行与按服务 ID 的时刻对齐求差（始终取各侧首项）
   web/index.html 操作页面（原生 JS，内置 3 个示例场景）
 Dockerfile
 docker-compose.yml

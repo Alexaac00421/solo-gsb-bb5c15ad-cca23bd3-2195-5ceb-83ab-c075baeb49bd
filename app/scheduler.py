@@ -19,12 +19,18 @@ CP-SAT 的 NoOverlap 不接受约束级 enforcement literal，因此采用“可
 NoOverlap 自动忽略；求解时把所有字面量加入假设（assumptions）。
 不可行时 CP-SAT 返回足以导致矛盾的字面量子集（sufficient assumption core），
 即“阻塞它的约束组合”，而不会给出任何部分排程。
+
+备选方案（alternative_count 启用时）：逐项迭代求解，每项都在同一模型上额外叠加
+“与此前每个方案互异”的约束——至少一个**未锁定**服务的部署开始 UTC 时刻相差达到
+最小差距（秒）；锁定服务参与全部硬约束但不参与互异判定。每项沿用与首项完全相同
+的目标（无参考时刻时单层尽早和；有参考时刻时三层词典序），且必须证明 OPTIMAL 才
+采纳；已证实 INFEASIBLE 即穷尽，超时一律 unknown，绝不返回未验证方案。
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ortools.sat.python import cp_model
@@ -38,6 +44,23 @@ class SolveResult:
     status: str  # optimal | feasible | infeasible | unknown
     starts: dict[str, int] | None
     blockers: list[dict] | None
+
+
+@dataclass
+class AlternativesResult:
+    """同一请求的多个可执行时序（逐项择优的完整方案）。
+
+    - feasible=False 且 starts 为空：首项即 infeasible/unknown，blockers 为首项阻塞组合；
+    - feasible=True：starts[0] 为首项（与单解接口首项一致），starts[1:] 为互异后续项；
+      status 为 complete（凑够请求数量）/ exhausted（已证实无更多方案）/
+      unknown（求解超时；已验证的方案仍在 starts 中，不返回未验证方案）。
+    """
+
+    feasible: bool
+    status: str  # complete | exhausted | unknown | infeasible
+    first_status: str  # 首项求解状态：optimal | feasible | infeasible | unknown
+    starts: list[dict[str, int]] = field(default_factory=list)
+    blockers: list[dict] | None = None
 
 
 def _iso(ts: int) -> str:
@@ -138,7 +161,34 @@ def _add_segment_capacity(m: cp_model.CpModel, starts, services, users: list[str
     m.add_cumulative(clamped, [1] * len(clamped), cap)
 
 
-def solve(norm: Normalized) -> SolveResult:
+@dataclass
+class _BuiltModel:
+    m: cp_model.CpModel
+    starts: dict[str, cp_model.IntVar]
+    assumption_map: dict[int, tuple[str, str]]
+    H0: int
+    H1: int
+    early_expr: object
+    ref_exprs: dict[str, tuple[cp_model.IntVar, cp_model.IntVar]]
+
+    def infeasible_blockers(self, solver) -> list[dict]:
+        core_literals = solver.sufficient_assumptions_for_infeasibility()
+        if core_literals:
+            return [{"code": self.assumption_map[lit][0],
+                     "message": self.assumption_map[lit][1]}
+                    for lit in core_literals]
+        return [{"code": code, "message": msg}
+                for code, msg in self.assumption_map.values()]
+
+
+def _build_model(norm: Normalized,
+                 prev_solutions: list[dict[str, int]] | None = None,
+                 gap: int = 60) -> _BuiltModel:
+    """构建全部业务约束模型。
+
+    prev_solutions 非空时，对每个此前方案叠加互异约束：至少一个**未锁定**服务的
+    部署开始时刻与其相差达到 gap 秒（锁定服务不参与互异判定）。
+    """
     m = cp_model.CpModel()
     services = norm.services
 
@@ -311,9 +361,25 @@ def solve(norm: Normalized) -> SolveResult:
             starts[d.downstream] >= starts[d.upstream] + up.duration + d.gap
         ).only_enforce_if(lit)
 
-    # ---- 目标 ----
+    # ---- 备选互异约束（仅启用备选且存在此前方案时） ----
+    # 对每个此前方案 prev：∨_{未锁定服务 i} |start_i - prev_i| ≥ gap。
+    # 即至少一个未锁定服务的部署开始 UTC 时刻与 prev 相差达到最小差距；
+    # 锁定服务（等式硬约束）不参与互异判定——全部服务锁定时该析取为空，
+    # 数学上只有唯一方案，迭代立即 INFEASIBLE（穷尽）。
+    unpinned = [sid for sid in services if sid not in norm.pinned_starts]
+    for k, prev in enumerate(prev_solutions or []):
+        diff_lits = []
+        for sid in unpinned:
+            away = m.new_bool_var(f"alt{k}_{sid}_away")
+            m.add(starts[sid] - prev[sid] >= gap).only_enforce_if(away)
+            m.add(prev[sid] - starts[sid] >= gap).only_enforce_if(away.Not())
+            diff_lits.append(away)
+        if diff_lits:
+            m.add_bool_or(diff_lits)
+
+    # ---- 目标表达式 ----
     # 无参考时刻时沿用原目标：所有服务部署开始时刻之和最小（尽量早、可复现）。
-    # 给出参考时刻时采用三层词典序目标，逐层分别求解且每层都必须证明最优：
+    # 给出参考时刻时采用三层词典序目标（逐层分别求解且每层都必须证明最优）：
     #   1) 最小化偏离参考时刻的服务数（未给参考时刻的服务不参与本层）；
     #   2) 在 1) 最优的前提下最小化偏移总时长（秒，早于/晚于均计为绝对偏差）；
     #   3) 在前两层最优的前提下最小化所有服务部署开始时刻之和（原“尽早发布”目标，
@@ -334,95 +400,149 @@ def solve(norm: Normalized) -> SolveResult:
             m.add(dev >= 1).only_enforce_if(off)
             m.add(dev == 0).only_enforce_if(off.Not())
             ref_exprs[sid] = (off, dev)
-        count_expr = sum(off for off, _ in ref_exprs.values())
-        total_dev_expr = sum(dev for _, dev in ref_exprs.values())
 
-    def run_solve(deadline: float):
-        # 共享总时限：每层最多用到 deadline 为止；剩余极少时给 10ms 下限，避免 0 时长。
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = max(0.01, deadline - time.monotonic())
-        solver.parameters.num_search_workers = 8
-        status = solver.solve(m)
-        return status, solver
+    return _BuiltModel(
+        m=m, starts=starts, assumption_map=assumption_map, H0=H0, H1=H1,
+        early_expr=early_expr, ref_exprs=ref_exprs)
 
-    def infeasible_result(solver) -> SolveResult:
-        core_literals = solver.sufficient_assumptions_for_infeasibility()
-        blockers = []
-        if core_literals:
-            for lit in core_literals:
-                code, message = assumption_map[lit]
-                blockers.append({"code": code, "message": message})
-        else:
-            blockers = [{"code": code, "message": msg}
-                        for code, msg in assumption_map.values()]
-        return SolveResult(False, "infeasible", None, blockers)
 
-    def unknown_result(layered: bool = False) -> SolveResult:
-        if layered:
-            message = (
-                "求解器在时限内未能证明分层目标（偏离参考时刻的服务数 → "
-                "偏移总时长 → 尽早发布）的最优性，按约定不输出排程；"
-                "可增大 max_solve_seconds 后重试"
-            )
-        else:
-            message = (
-                "求解器在时限内未能判定可行性（未证明最优），"
-                "可增大 max_solve_seconds 后重试"
-            )
-        return SolveResult(
-            False, "unknown", None,
-            [{"code": "solver_unknown", "message": message}],
-        )
+def _run_layer(bm: _BuiltModel, objective_expr, deadline: float):
+    """在共享时限内对当前目标求解一次，返回 (status, solver)。"""
+    solver = cp_model.CpSolver()
+    # 每层最多用到 deadline 为止；剩余极少时给 10ms 下限，避免 0 时长。
+    solver.parameters.max_time_in_seconds = max(0.01, deadline - time.monotonic())
+    solver.parameters.num_search_workers = 8
+    bm.m.minimize(objective_expr)
+    status = solver.solve(bm.m)
+    return status, solver
 
-    deadline = time.monotonic() + norm.max_solve_seconds
 
-    if not norm.reference_starts:
-        # 原行为：单层“尽早发布”；FEASIBLE（未证明最优）也照常返回。
-        m.minimize(early_expr)
-        status, solver = run_solve(deadline)
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return SolveResult(
-                feasible=True,
-                status="optimal" if status == cp_model.OPTIMAL else "feasible",
-                starts={sid: solver.value(v) for sid, v in starts.items()},
-                blockers=None,
-            )
+def _optimize(bm: _BuiltModel, deadline: float, strict: bool):
+    """按请求配置的目标求最优解。
+
+    strict=False（旧行为、无参考时刻）：单层尽早和，FEASIBLE（未证明最优）也照常返回。
+    strict=True（备选模式）：
+      * 无参考时刻：单层尽早和，必须证明 OPTIMAL 才采纳；
+      * 有参考时刻：三层词典序，每层都必须在共享时限内证明 OPTIMAL，
+        否则 unknown（不输出任何未验证方案）。
+    返回 (status, starts|None, solver|None)；
+    status ∈ optimal | feasible | infeasible | unknown。
+    """
+    m = bm.m
+
+    if not bm.ref_exprs:
+        status, solver = _run_layer(bm, bm.early_expr, deadline)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and (
+                not strict or status == cp_model.OPTIMAL):
+            return ("optimal" if status == cp_model.OPTIMAL else "feasible",
+                    {sid: solver.value(v) for sid, v in bm.starts.items()}, None)
         if status == cp_model.INFEASIBLE:
-            return infeasible_result(solver)
-        return unknown_result()
+            return "infeasible", None, solver
+        return "unknown", None, None
 
     # 分层优化：每一层都必须在共享时限内证明 OPTIMAL，否则 unknown（不输出排程）。
     # 第 1 层：偏离参考时刻的服务数最少。
-    m.minimize(count_expr)
-    status, solver = run_solve(deadline)
+    count_expr = sum(off for off, _ in bm.ref_exprs.values())
+    total_dev_expr = sum(dev for _, dev in bm.ref_exprs.values())
+
+    status, solver = _run_layer(bm, count_expr, deadline)
     if status == cp_model.INFEASIBLE:
-        return infeasible_result(solver)
+        return "infeasible", None, solver
     if status != cp_model.OPTIMAL:
-        return unknown_result(layered=True)
+        return "unknown", None, None
     best_count = int(round(solver.objective_value))
     m.add(count_expr <= best_count)
 
     # 第 2 层：偏移总时长最短。
-    m.minimize(total_dev_expr)
-    status, solver = run_solve(deadline)
+    status, solver = _run_layer(bm, total_dev_expr, deadline)
     if status == cp_model.INFEASIBLE:
-        return infeasible_result(solver)
+        return "infeasible", None, solver
     if status != cp_model.OPTIMAL:
-        return unknown_result(layered=True)
+        return "unknown", None, None
     best_dev = int(round(solver.objective_value))
     m.add(total_dev_expr <= best_dev)
 
     # 第 3 层：尽早发布（所有服务开始时刻之和最小）。
-    m.minimize(early_expr)
-    status, solver = run_solve(deadline)
+    status, solver = _run_layer(bm, bm.early_expr, deadline)
     if status == cp_model.INFEASIBLE:
-        return infeasible_result(solver)
+        return "infeasible", None, solver
     if status != cp_model.OPTIMAL:
-        return unknown_result(layered=True)
+        return "unknown", None, None
 
-    return SolveResult(
-        feasible=True,
-        status="optimal",
-        starts={sid: solver.value(v) for sid, v in starts.items()},
-        blockers=None,
-    )
+    return "optimal", {sid: solver.value(v) for sid, v in bm.starts.items()}, None
+
+
+def _unknown_message(layered: bool) -> dict:
+    if layered:
+        return {"code": "solver_unknown",
+                "message": (
+                    "求解器在时限内未能证明分层目标（偏离参考时刻的服务数 → "
+                    "偏移总时长 → 尽早发布）的最优性，按约定不输出排程；"
+                    "可增大 max_solve_seconds 后重试")}
+    return {"code": "solver_unknown",
+            "message": (
+                "求解器在时限内未能判定可行性（未证明最优），"
+                "可增大 max_solve_seconds 后重试")}
+
+
+def solve(norm: Normalized) -> SolveResult:
+    """单解接口（旧行为）：无参考时刻时 FEASIBLE 也照常返回；有参考时刻时三层均须最优。"""
+    deadline = time.monotonic() + norm.max_solve_seconds
+    bm = _build_model(norm)
+    strict = bool(norm.reference_starts)
+    status, starts, solver = _optimize(bm, deadline, strict=strict)
+    if status in ("optimal", "feasible"):
+        return SolveResult(True, status, starts, None)
+    if status == "infeasible":
+        assert solver is not None
+        return SolveResult(False, "infeasible", None, bm.infeasible_blockers(solver))
+    return SolveResult(False, "unknown", None,
+                       [_unknown_message(layered=bool(norm.reference_starts))])
+
+
+def solve_alternatives(norm: Normalized) -> AlternativesResult:
+    """多方案接口：逐项迭代求互异的完整可执行方案，每项按同一目标严格择优。
+
+    - 首项与 solve() 采用完全相同的目标与全部业务约束，但必须证明 OPTIMAL 才采纳
+      （未证明最优的 FEASIBLE 不返回——备选模式下不输出任何未验证方案）；
+    - 后续项在同一模型上对每个此前方案叠加“至少一个未锁定服务部署开始时刻相差
+      ≥ gap 秒”的析取，再按同一目标求最优；
+    - 某项被证明 INFEASIBLE：首项 → 无解（返回首项阻塞组合，不返回部分排程）；
+      后续项 → 已穷尽（exhausted，返回此前全部已验证方案）；
+    - 某项超时未判定：首项 → unknown；后续项 → unknown 且只返回此前已验证方案，
+      绝不误报穷尽、绝不返回未验证方案；
+    - 凑够 alternative_count → complete；
+    - 全部服务锁定时不存在可互异维度，至多返回首项（后续直接 exhausted）。
+    """
+    assert norm.alternative_count is not None
+    wanted = norm.alternative_count
+    gap = norm.alternative_gap
+    layered = bool(norm.reference_starts)
+    deadline = time.monotonic() + norm.max_solve_seconds
+    solutions: list[dict[str, int]] = []
+    # 未锁定服务为空时，互异析取无变量可挂：数学上只有唯一方案，首项之后直接穷尽。
+    has_unpinned = any(sid not in norm.pinned_starts for sid in norm.services)
+
+    for k in range(wanted):
+        if k >= 1 and not has_unpinned:
+            return AlternativesResult(True, "exhausted", "optimal", solutions)
+        bm = _build_model(norm, prev_solutions=solutions, gap=gap)
+        status, starts, solver = _optimize(bm, deadline, strict=True)
+        if k == 0:
+            if status == "infeasible":
+                assert solver is not None
+                return AlternativesResult(
+                    False, "infeasible", "infeasible", [],
+                    bm.infeasible_blockers(solver))
+            if status == "unknown":
+                return AlternativesResult(
+                    False, "unknown", "unknown", [], [_unknown_message(layered)])
+        else:
+            if status == "infeasible":
+                return AlternativesResult(True, "exhausted", "optimal", solutions)
+            if status == "unknown":
+                return AlternativesResult(True, "unknown", "optimal", solutions)
+        solutions.append(starts)
+
+    return AlternativesResult(True, "complete", "optimal", solutions)
+

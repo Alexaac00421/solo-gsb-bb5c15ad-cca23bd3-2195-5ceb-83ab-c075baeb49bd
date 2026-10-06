@@ -35,15 +35,17 @@ def health() -> dict:
 
 
 @app.post("/api/schedule", response_model=ScheduleResponse)
-def schedule(req: ScheduleRequest) -> ScheduleResponse:
+def schedule(req: ScheduleRequest):
     run = run_request(req)
 
     if run.empty:
-        return ScheduleResponse(
+        # 空服务列表与备选无关：沿用旧的 empty_services 阻塞响应（不出现备选字段）。
+        resp = ScheduleResponse(
             feasible=False, status="infeasible",
             blockers=[BlockingConstraint(code="empty_services",
                                         message="至少需要一个服务")],
         )
+        return _dump(resp, enabled=False)
 
     if run.validation_errors is not None:
         # 422：输入本身有问题（DST 重复/不存在、坏时区、依赖环、区间非法等）。
@@ -55,17 +57,54 @@ def schedule(req: ScheduleRequest) -> ScheduleResponse:
     norm, result = run.norm, run.result
 
     if not result.feasible:
-        return ScheduleResponse(
+        resp = ScheduleResponse(
             feasible=False,
             status=result.status,
             blockers=[BlockingConstraint(**b) for b in (result.blockers or [])],
         )
+        # 备选模式下首项无解/超时：不返回任何方案（含部分排程），仅附穷尽状态标记
+        # （超时时为 unknown，绝不误报 exhausted）；备选字段省略时响应与旧版一致。
+        if run.alternatives is not None:
+            resp.alternatives_status = run.alternatives.status
+        return _dump(resp, enabled=run.alternatives is not None)
 
-    return ScheduleResponse(
-        feasible=True, status=result.status,
-        schedule=[_build_item(norm, sid, st)
-                  for sid, st in sorted(result.starts.items(), key=lambda kv: kv[1])],
+    items = [_build_item(norm, sid, st)
+             for sid, st in sorted(result.starts.items(), key=lambda kv: kv[1])]
+
+    if run.alternatives is None:
+        # 未启用备选：响应与旧版本完全一致（不含 alternatives 相关键）。
+        return _dump(ScheduleResponse(
+            feasible=True, status=result.status, schedule=items), enabled=False)
+
+    # 启用备选：首项即 schedule；alternatives 给出逐项择优的全部完整方案。
+    alt_plans = [
+        [_build_item(norm, sid, st)
+         for sid, st in sorted(plan.items(), key=lambda kv: kv[1])]
+        for plan in run.alternatives.starts
+    ]
+    resp = ScheduleResponse(
+        feasible=True,
+        # 首项在备选模式下必然已证明 OPTIMAL；后续超时不影响已验证首项。
+        status="optimal",
+        schedule=items,
+        alternatives=alt_plans,
+        alternatives_status=run.alternatives.status,
     )
+    return _dump(resp, enabled=True)
+
+
+def _dump(resp: ScheduleResponse, *, enabled: bool):
+    """序列化响应。
+
+    未启用备选时显式剔除 alternatives / alternatives_status，保证旧客户端看到的
+    JSON 与旧版本逐键一致；启用备选时保留这两个键（值为 null 也保留）。
+    """
+    from fastapi.responses import JSONResponse
+    data = resp.model_dump(mode="json")
+    if not enabled:
+        data.pop("alternatives", None)
+        data.pop("alternatives_status", None)
+    return JSONResponse(content=data)
 
 
 def _build_item(norm, sid: str, st: int) -> ScheduleItem:
