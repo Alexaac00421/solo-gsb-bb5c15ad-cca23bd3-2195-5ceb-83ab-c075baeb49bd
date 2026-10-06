@@ -69,6 +69,8 @@ class Normalized:
     capacity_periods: dict[str, list[CapacityPeriod]]  # 资源 -> 临时容量时段（按开始时刻排序，互不重叠）
     pinned_starts: dict[str, int]  # 已确认服务 -> 锁定部署开始时刻（UTC epoch 秒）
     reference_starts: dict[str, int]  # 给出参考时刻的服务 -> 参考部署开始时刻（UTC epoch 秒）
+    alternative_count: int | None  # 备选方案总数（含首项，1~5）；None 表示不启用备选方案
+    min_gap_seconds: int  # 备选方案之间的最小差距（秒）；仅在 alternative_count 给出时生效
     max_solve_seconds: float
 
 
@@ -336,6 +338,10 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         capacity_periods=capacity_periods,
         pinned_starts=pinned_starts,
         reference_starts=reference_starts,
+        # 备选方案：范围（1~5 / 正整数）由 Pydantic 字段校验把关；最小差距缺省 1 分钟。
+        # 只给 min_gap_minutes 而未给 alternative_count 时不启用备选，差距参数不生效。
+        alternative_count=req.alternative_count,
+        min_gap_seconds=(req.min_gap_minutes or 1) * 60,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 

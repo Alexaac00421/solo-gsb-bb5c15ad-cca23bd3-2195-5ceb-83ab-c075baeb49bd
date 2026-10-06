@@ -95,6 +95,17 @@ class ScheduleRequest(BaseModel):
         "再最小化偏移总秒数，最后最小化部署开始时刻之和），不豁免任何约束；"
         "未给出参考时刻的服务只参与最后一层（尽早发布）目标",
     )
+    alternative_count: int | None = Field(
+        None, ge=1, le=5,
+        description="发布评审备选方案总数（含首项，1~5）。省略时不启用备选方案，响应与旧版本一致；"
+        "启用后按同一优化目标逐项求解，每项方案相对此前每项方案至少有一个未锁定服务的"
+        "部署开始 UTC 时刻相差达到 min_gap_minutes",
+    )
+    min_gap_minutes: int | None = Field(
+        None, ge=1,
+        description="备选方案之间的最小差距（正整数分钟）：任意两项方案之间至少一个未锁定服务的"
+        "部署开始 UTC 时刻之差不小于该值；仅在 alternative_count 给出时生效，省略按 1 分钟处理",
+    )
     max_solve_seconds: float = Field(10.0, gt=0, le=60)
 
 
@@ -115,11 +126,30 @@ class BlockingConstraint(BaseModel):
     message: str
 
 
+# ---- 发布评审：备选方案 ----
+
+
+class AlternativePlan(BaseModel):
+    index: int = Field(..., description="方案序号（0 为首项，与顶层 schedule 内容一致）")
+    schedule: list[ScheduleItem]
+
+
+class AlternativesInfo(BaseModel):
+    requested: int = Field(..., description="请求的方案总数（alternative_count）")
+    min_gap_minutes: int = Field(..., description="实际生效的方案间最小差距（分钟）")
+    status: str = Field(
+        ..., description="complete=已凑够请求数量；exhausted=已证实无更多方案；"
+        "unknown=求解超时，是否还有更多方案未能判定（已返回的方案均已验证）")
+    plans: list[AlternativePlan] = Field(..., description="按同一优化目标逐项择优得到的完整方案")
+
+
 class ScheduleResponse(BaseModel):
     feasible: bool
     schedule: list[ScheduleItem] | None = None
     blockers: list[BlockingConstraint] | None = None
     status: str  # "optimal" | "feasible" | "infeasible" | "unknown"
+    alternatives: AlternativesInfo | None = Field(
+        None, description="备选方案结果；仅在请求给出 alternative_count 时非空")
 
 
 # ---- 变更影响预演（/api/schedule/diff） ----

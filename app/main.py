@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import (
+    AlternativePlan,
+    AlternativesInfo,
     BlockingConstraint,
     ScheduleDiffRequest,
     ScheduleDiffResponse,
@@ -61,10 +63,26 @@ def schedule(req: ScheduleRequest) -> ScheduleResponse:
             blockers=[BlockingConstraint(**b) for b in (result.blockers or [])],
         )
 
+    def build_plan(starts: dict[str, int]) -> list[ScheduleItem]:
+        return [_build_item(norm, sid, st)
+                for sid, st in sorted(starts.items(), key=lambda kv: kv[1])]
+
+    # 备选方案（仅在请求给出 alternative_count 时非空）：plans[0] 即首项，
+    # 与顶层 schedule 内容一致，未启用备选时 alternatives 为 null，响应保持兼容。
+    alternatives = None
+    if result.plans is not None:
+        alternatives = AlternativesInfo(
+            requested=norm.alternative_count,
+            min_gap_minutes=norm.min_gap_seconds // 60,
+            status=result.alternatives_status,
+            plans=[AlternativePlan(index=i, schedule=build_plan(p))
+                   for i, p in enumerate(result.plans)],
+        )
+
     return ScheduleResponse(
         feasible=True, status=result.status,
-        schedule=[_build_item(norm, sid, st)
-                  for sid, st in sorted(result.starts.items(), key=lambda kv: kv[1])],
+        schedule=build_plan(result.starts),
+        alternatives=alternatives,
     )
 
 

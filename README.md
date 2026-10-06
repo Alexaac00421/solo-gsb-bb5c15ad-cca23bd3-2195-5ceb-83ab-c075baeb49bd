@@ -4,6 +4,8 @@
 系统用 Google OR-Tools CP-SAT 求出满足全部约束的可执行排程；无解时返回**阻塞它的约束组合**而不是部分结果。
 排程调整时还可提交**已确认服务的锁定开始时刻**（必须准时部署）与**未确认服务的参考开始时刻**
 （按"偏离服务数 → 偏移总时长 → 尽早发布"三层词典序优化），二者均不豁免任何既有约束。
+发布评审时可要求返回 **1~5 个备选方案**：首项沿用同一优化目标，后续每项满足全部约束，
+且与此前每项方案至少有一个未锁定服务的部署开始时刻相差达到最小差距。
 
 ## 约束语义
 
@@ -97,6 +99,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     {"service": "api-gateway", "start": "2026-11-14T07:00", "timezone": "Asia/Shanghai"},
     {"service": "ledger", "start": "2026-11-13T21:00:00-05:00"}
   ],
+  "alternative_count": 3,
+  "min_gap_minutes": 60,
   "max_solve_seconds": 10
 }
 ```
@@ -224,6 +228,109 @@ curl -X POST http://localhost:8000/api/schedule \
 modified 新增 `pinned_starts`，差异会体现在被移动的服务上；modified 一侧锁定冲突
 （infeasible/unknown）或输入错误（422）时，仍只在 `failures.modified` 给出含 `lock:` 条件的
 阻塞组合 / 完整错误列表，`diff` 为 `null`。
+
+### 发布评审：备选方案（本轮新增）
+
+发布评审需要从**同一请求**查看不同的可执行时序时，在 `/api/schedule` 请求体中加入两个**可选**字段：
+
+- `alternative_count`：备选方案总数（**含首项**，整数 **1~5**）。省略（或传 `null`）时不启用
+  备选方案，响应与旧版本完全一致（`alternatives` 为 `null`）。
+- `min_gap_minutes`：方案间最小差距（**正整数分钟**）。仅在 `alternative_count` 给出时生效，
+  省略按 **1 分钟**处理；只给 `min_gap_minutes` 而不给 `alternative_count` 时不启用备选。
+
+启用后按**同一优化目标**（无参考时刻时的单层"尽早发布"，或有 `reference_starts` 时的
+三层词典序目标）逐项求解：
+
+- **首项**与未启用备选时的排程完全一致；
+- **后续每项**同样满足全部候选窗、依赖、团队禁发、维护冻结、资源（分时）容量及锁定约束，
+  并且相对**每个**此前方案，至少一个**未锁定服务**的部署开始 UTC 时刻相差达到最小差距
+  （`|开始时刻差| ≥ min_gap_minutes`；锁定服务的时刻固定，不参与差距判定）；
+- 每项都是在"与此前各项拉开差距"的约束下按同一目标重新择优的**完整方案**，
+  不是对首项的局部扰动。
+
+响应新增 `alternatives` 对象（`plans[0]` 即首项，与顶层 `schedule` 内容一致）：
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "schedule": [ "…首项排程…" ],
+  "blockers": null,
+  "alternatives": {
+    "requested": 3,
+    "min_gap_minutes": 60,
+    "status": "complete",
+    "plans": [
+      {"index": 0, "schedule": [ "…首项…" ]},
+      {"index": 1, "schedule": [ "…第二项…" ]},
+      {"index": 2, "schedule": [ "…第三项…" ]}
+    ]
+  }
+}
+```
+
+`alternatives.status` 三种取值：
+
+| 取值 | 含义 |
+|---|---|
+| `complete` | 已凑够请求数量（`plans` 长度 == `requested`） |
+| `exhausted` | **已证实无更多方案**：继续求解被判定不可行，或全部服务均已锁定；`plans` 为已找到的全部方案 |
+| `unknown` | 求解超时，是否还有更多方案**未能判定**；`plans` 中已返回的方案均已验证，可增大 `max_solve_seconds` 后重试 |
+
+规则细节：
+
+- **全部服务锁定**时不存在可移动的未锁定服务，任何方案都无法与首项拉开差距，
+  至多返回首项（`status: "exhausted"`）。
+- **首项无解**沿用现有行为：返回阻塞组合（`feasible=false`、`blockers`），不返回部分排程，
+  `alternatives` 为 `null`；首项求解超时同样沿用 `status: "unknown"` 的现有响应。
+- **输入非法**沿用校验错误：`alternative_count` 超出 1~5、`min_gap_minutes` 非正整数等按 422 拒绝。
+- 全部方案共享 `max_solve_seconds` 总时限；后续项求解超时**不会误报穷尽**，
+  也不会返回未验证的方案（`status: "unknown"`，已返回项均完整有效）。
+- `/api/schedule/diff` 的两侧请求可携带备选字段并各自独立求解，但差异预演
+  **仍只比较各侧首项**，不为备选方案逐一求差。
+
+调用示例（curl）：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id":"a","name":"服务 A","timezone":"UTC",
+       "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]},
+      {"id":"b","name":"服务 B","timezone":"UTC",
+       "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]}
+    ],
+    "alternative_count": 3,
+    "min_gap_minutes": 60
+  }'
+```
+
+上例中 `a`、`b` 共享容量 1 的 `db` 无法同刻部署，返回（200，节选）：
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "alternatives": {
+    "requested": 3,
+    "min_gap_minutes": 60,
+    "status": "complete",
+    "plans": [
+      {"index": 0, "schedule": ["…a 00:00 → b 01:00…"]},
+      {"index": 1, "schedule": ["…b 00:00 → a 01:00…"]},
+      {"index": 2, "schedule": ["…b 00:00 → a 02:00…"]}
+    ]
+  }
+}
+```
+
+首项 `a` 00:00 / `b` 01:00；第二项交换顺序；第三项 `b` 00:00 / `a` 02:00——
+任意两项之间都至少有一个服务相差 ≥ 60 分钟。把窗口缩短到只容得下两种排法时，
+请求 5 项会返回 `"status": "exhausted"` 与已找到的 2 项；两个服务都加
+`pinned_starts` 锁定时则只回首项。
 
 时间串支持两种写法：
 

@@ -59,6 +59,7 @@
     <div class="btns">
       <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
       <button class="secondary" onclick="loadScenario('adjust')">排程调整：锁定+参考时刻</button>
+      <button class="secondary" onclick="loadScenario('alternatives')">发布评审：备选方案</button>
       <button class="secondary" onclick="loadScenario('capacity')">共享资源并行容量</button>
       <button class="secondary" onclick="loadScenario('throttle')">临时限流时段</button>
       <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
@@ -159,8 +160,23 @@ const SCENARIOS = {
       {service:"ledger", start:"2026-11-13T21:00", timezone:"America/New_York"}
     ]
   },
-  capacity: {
+  alternatives: {
+    // 发布评审：同一请求查看多个可执行时序。首项与未启用时一致；后续每项同样满足
+    // 全部约束，且相对每个此前方案至少一个未锁定服务的开始时刻相差 ≥ min_gap_minutes。
+    // alternatives.status：complete=凑够数量 / exhausted=已证实无更多 / unknown=超时未判定。
     services: [
+      { id:"a", name:"服务 A", timezone:"UTC",
+        duration_minutes:60, rollback_minutes:0, resources:["db"],
+        windows:[{start:"2026-12-01T00:00:00Z", end:"2026-12-01T08:00:00Z", timezone:"UTC"}]},
+      { id:"b", name:"服务 B", timezone:"UTC",
+        duration_minutes:60, rollback_minutes:0, resources:["db"],
+        windows:[{start:"2026-12-01T00:00:00Z", end:"2026-12-01T08:00:00Z", timezone:"UTC"}]}
+    ],
+    alternative_count: 3,
+    min_gap_minutes: 60,
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
+  },
+  capacity: {    services: [
       { id:"canary-a", name:"灰度服务 A", timezone:"UTC",
         duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
         windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
@@ -254,7 +270,8 @@ async function submit(){
   }
 
   if (data.feasible){
-    const rows = data.schedule.map((it,i)=>`
+    const renderTable = (sched) => {
+      const rows = sched.map((it,i)=>`
       <tr>
         <td>${i+1}</td>
         <td><b>${esc(it.name)}</b><br><span class="muted mono">${esc(it.service_id)}</span></td>
@@ -264,9 +281,20 @@ async function submit(){
         <td>${it.resources.map(r=>`<span class="tag">${esc(r)}</span>`).join('')||'<span class="muted">—</span>'}</td>
         <td class="mono muted">${esc(it.window_used)}</td>
       </tr>`).join('');
-    box.innerHTML = `
-      <div class="banner ok">✓ 找到${data.status==='optimal'?'最优':'可行'}排程，共 ${data.schedule.length} 个服务，全部约束均满足（UTC 时刻按开始时间排序）。</div>
-      <table><thead><tr><th>#</th><th>服务</th><th>部署开始 (UTC)</th><th>本地时间</th><th>占用至 (含回滚)</th><th>资源</th><th>命中窗口</th></tr></thead><tbody>${rows}</tbody></table>`;
+      return `<table><thead><tr><th>#</th><th>服务</th><th>部署开始 (UTC)</th><th>本地时间</th><th>占用至 (含回滚)</th><th>资源</th><th>命中窗口</th></tr></thead><tbody>${rows}</tbody></table>`;
+    };
+    let html = `<div class="banner ok">✓ 找到${data.status==='optimal'?'最优':'可行'}排程，共 ${data.schedule.length} 个服务，全部约束均满足（UTC 时刻按开始时间排序）。</div>`;
+    if (data.alternatives){
+      const alt = data.alternatives;
+      const stText = {complete:'已凑够请求数量（完成）',
+                      exhausted:'已证实无更多方案（穷尽）',
+                      unknown:'求解超时，是否还有更多方案未能判定（已返回的方案均已验证）'}[alt.status] || alt.status;
+      html += `<div class="banner ${alt.status==='unknown'?'err':'ok'}">备选方案：请求 ${alt.requested} 项 / 实际返回 ${alt.plans.length} 项，最小差距 ${alt.min_gap_minutes} 分钟 —— ${esc(stText)}</div>`;
+      html += alt.plans.map(p=>`<h2 style="margin:14px 0 8px;font-size:13px;color:var(--muted)">方案 ${p.index+1}</h2>` + renderTable(p.schedule)).join('');
+    } else {
+      html += renderTable(data.schedule);
+    }
+    box.innerHTML = html;
   } else {
     const bl = (data.blockers||[]).map(b=>`<div class="blocker"><span class="code">${esc(b.code)}</span>${esc(b.message)}</div>`).join('');
     box.innerHTML = `
