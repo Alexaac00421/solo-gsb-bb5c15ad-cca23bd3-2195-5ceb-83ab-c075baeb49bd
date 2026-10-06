@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>跨时区发布窗口编排</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --txt:#e2e8f0;
+          --muted:#94a3b8; --green:#22c55e; --red:#ef4444; --amber:#f59e0b; --blue:#38bdf8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--txt); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(380px,1fr) minmax(420px,1.2fr); gap:16px; padding:16px 24px; }
+  @media (max-width:980px){ main{grid-template-columns:1fr;} }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .panel h2 { margin:0 0 10px; font-size:14px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
+  button { background:var(--blue); color:#082f49; border:0; border-radius:6px; padding:7px 12px;
+           font-size:13px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#475569; color:#e2e8f0; }
+  button:hover { filter:brightness(1.1); }
+  textarea { width:100%; height:62vh; background:#0b1220; color:var(--txt); border:1px solid var(--line);
+             border-radius:8px; padding:10px; font-family:ui-monospace,Menlo,Consolas,monospace;
+             font-size:12.5px; line-height:1.5; resize:vertical; }
+  .banner { border-radius:8px; padding:10px 12px; margin-bottom:12px; font-size:14px; font-weight:600; }
+  .banner.ok { background:rgba(34,197,94,.15); border:1px solid var(--green); color:#86efac; }
+  .banner.fail { background:rgba(239,68,68,.15); border:1px solid var(--red); color:#fca5a5; }
+  .banner.err { background:rgba(245,158,11,.15); border:1px solid var(--amber); color:#fcd34d; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .muted { color:var(--muted); }
+  .blocker { border:1px solid var(--red); background:rgba(239,68,68,.08); border-radius:8px;
+             padding:10px 12px; margin-bottom:8px; font-size:13px; }
+  .blocker .code { font-family:ui-monospace,monospace; color:#fca5a5; font-size:11.5px; display:block; margin-bottom:4px; }
+  .inerr { border:1px solid var(--amber); background:rgba(245,158,11,.07); border-radius:8px;
+           padding:10px 12px; margin-bottom:8px; font-size:13px; }
+  .inerr .code { font-family:ui-monospace,monospace; color:#fcd34d; font-size:11.5px; }
+  .sug { margin:6px 0 0; padding-left:18px; }
+  .sug li { font-family:ui-monospace,monospace; font-size:12px; color:#fde68a; margin:2px 0; }
+  .tag { display:inline-block; background:#334155; border-radius:4px; padding:1px 6px;
+         font-size:11px; margin-right:4px; }
+  #result { min-height:200px; }
+  .spin { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌍 跨时区软件发布窗口编排</h1>
+  <p>输入服务依赖、候选窗口、团队禁发、维护冻结与回滚耗时，求满足全部约束的可执行排程；不可行时返回阻塞约束组合。</p>
+</header>
+<main>
+  <section class="panel">
+    <h2>请求（JSON）</h2>
+    <div class="btns">
+      <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
+      <button class="secondary" onclick="loadScenario('adjust')">排程调整：锁定+参考时刻</button>
+      <button class="secondary" onclick="loadScenario('capacity')">共享资源并行容量</button>
+      <button class="secondary" onclick="loadScenario('throttle')">临时限流时段</button>
+      <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
+      <button class="secondary" onclick="loadScenario('infeasible')">不可行示例</button>
+    </div>
+    <textarea id="payload" spellcheck="false"></textarea>
+    <div class="btns" style="margin-top:10px">
+      <button onclick="submit()">生成排程</button>
+      <button class="secondary" onclick="document.getElementById('payload').value=JSON.stringify(JSON.parse(document.getElementById('payload').value),null,2)">格式化</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>排程结果</h2>
+    <div id="result"><p class="muted">点击「生成排程」开始。</p></div>
+  </section>
+</main>
+
+<script>
+const SCENARIOS = {
+  basic: {
+    services: [
+      { id:"api-gateway", name:"API 网关", timezone:"Asia/Shanghai",
+        duration_minutes:30, rollback_minutes:60, resources:["k8s-prod-east"],
+        windows:[
+          {start:"2026-11-14T06:00", end:"2026-11-14T11:00", timezone:"Asia/Shanghai"},
+          {start:"2026-11-15T06:00", end:"2026-11-15T11:00", timezone:"Asia/Shanghai"}
+        ]},
+      { id:"payments", name:"支付服务", timezone:"Europe/Berlin",
+        duration_minutes:45, rollback_minutes:60, resources:["k8s-prod-east","payment-db"],
+        windows:[
+          {start:"2026-11-13T22:00", end:"2026-11-14T05:00", timezone:"Europe/Berlin"}
+        ]},
+      { id:"ledger", name:"账务批处理", timezone:"America/New_York",
+        duration_minutes:60, rollback_minutes:120, resources:["payment-db"],
+        windows:[
+          {start:"2026-11-13T20:00", end:"2026-11-14T23:00", timezone:"America/New_York"}
+        ]}
+    ],
+    dependencies: [
+      {upstream:"payments", downstream:"api-gateway", gap_minutes:30},
+      {upstream:"payments", downstream:"ledger", gap_minutes:60}
+    ],
+    service_teams: [
+      {service:"payments", team:"payment-team"},
+      {service:"ledger", team:"payment-team"}
+    ],
+    team_blackouts: [
+      {team:"payment-team", start:"2026-11-13T23:30", end:"2026-11-14T00:30", timezone:"Europe/Berlin"}
+    ],
+    freezes: [
+      {label:"周末封网", start:"2026-11-14T02:00", end:"2026-11-14T03:00", timezone:"UTC"}
+    ]
+  },
+  adjust: {
+    // 排程调整：payments 已确认必须在 22:30 Berlin 锁定部署；其余服务给出参考开始时刻。
+    // 目标分层：① 偏离参考时刻的服务数最少 → ② 偏移总时长最短 → ③ 尽早发布。
+    // 锁定与参考都不豁免候选窗、依赖、禁发、冻结、资源分时容量；冲突时 blockers 含 lock 条件。
+    services: [
+      { id:"api-gateway", name:"API 网关", timezone:"Asia/Shanghai",
+        duration_minutes:30, rollback_minutes:60, resources:["k8s-prod-east"],
+        windows:[
+          {start:"2026-11-14T06:00", end:"2026-11-14T11:00", timezone:"Asia/Shanghai"},
+          {start:"2026-11-15T06:00", end:"2026-11-15T11:00", timezone:"Asia/Shanghai"}
+        ]},
+      { id:"payments", name:"支付服务", timezone:"Europe/Berlin",
+        duration_minutes:45, rollback_minutes:60, resources:["k8s-prod-east","payment-db"],
+        windows:[
+          {start:"2026-11-13T22:00", end:"2026-11-14T05:00", timezone:"Europe/Berlin"}
+        ]},
+      { id:"ledger", name:"账务批处理", timezone:"America/New_York",
+        duration_minutes:60, rollback_minutes:120, resources:["payment-db"],
+        windows:[
+          {start:"2026-11-13T20:00", end:"2026-11-14T23:00", timezone:"America/New_York"}
+        ]}
+    ],
+    dependencies: [
+      {upstream:"payments", downstream:"api-gateway", gap_minutes:30},
+      {upstream:"payments", downstream:"ledger", gap_minutes:60}
+    ],
+    service_teams: [
+      {service:"payments", team:"payment-team"},
+      {service:"ledger", team:"payment-team"}
+    ],
+    team_blackouts: [
+      {team:"payment-team", start:"2026-11-13T23:30", end:"2026-11-14T00:30", timezone:"Europe/Berlin"}
+    ],
+    freezes: [
+      {label:"周末封网", start:"2026-11-14T02:00", end:"2026-11-14T03:00", timezone:"UTC"}
+    ],
+    // 已确认：支付服务锁定 22:30 Berlin（= 21:30 UTC）准时部署
+    pinned_starts: [
+      {service:"payments", start:"2026-11-13T22:30", timezone:"Europe/Berlin"}
+    ],
+    // 未确认服务的参考开始时刻（墙上时间 + 时区；也可写 ...Z / +08:00 绝对时间）
+    reference_starts: [
+      {service:"api-gateway", start:"2026-11-14T07:00", timezone:"Asia/Shanghai"},
+      {service:"ledger", start:"2026-11-13T21:00", timezone:"America/New_York"}
+    ]
+  },
+  capacity: {
+    services: [
+      { id:"canary-a", name:"灰度服务 A", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"canary-b", name:"灰度服务 B", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"canary-c", name:"灰度服务 C", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]}
+    ],
+    // canary-pool 容量 2：A、B 可并行占用，C 错峰一小时；
+    // 改成 1 则三者串行，改成 0 会以 422（bad_resource_capacity）拒绝。
+    resource_capacities: { "canary-pool": 2 },
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
+  },
+  throttle: {
+    services: [
+      { id:"canary-a", name:"灰度服务 A", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"canary-b", name:"灰度服务 B", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]}
+    ],
+    // 基准容量 2 本可都在 00:00 并行；00:30~01:30 临时限流为 0（不可占用），
+    // 两个 1 小时占用区间双双顺延到 01:30 开始。时段左闭右开：01:30 开始的占用不受限。
+    resource_capacities: { "canary-pool": 2 },
+    resource_capacity_periods: [
+      { resource:"canary-pool", start:"2026-12-01T00:30:00Z",
+        end:"2026-12-01T01:30:00Z", timezone:"UTC", capacity:0 }
+    ],
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
+  },
+  dst: {
+    services: [
+      { id:"svc-amb", name:"秋令时重复时刻服务", timezone:"America/New_York",
+        duration_minutes:20, rollback_minutes:30,
+        windows:[
+          // 2026-11-01 01:30 在纽约时区发生两次（EDT 与 EST）
+          {start:"2026-11-01T01:30", end:"2026-11-01T04:00", timezone:"America/New_York"}
+        ]},
+      { id:"svc-gap", name:"春令时不存在时刻服务", timezone:"America/New_York",
+        duration_minutes:20, rollback_minutes:30,
+        windows:[
+          // 2027-03-14 02:30 在纽约时区不存在（时钟 02:00 -> 03:00）
+          {start:"2027-03-14T02:30", end:"2027-03-14T05:00", timezone:"America/New_York"}
+        ]}
+    ],
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
+  },
+  infeasible: {
+    services: [
+      { id:"a", name:"服务 A", timezone:"UTC", duration_minutes:30, rollback_minutes:30,
+        resources:["shared-db"],
+        windows:[{start:"2026-12-01T02:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"b", name:"服务 B", timezone:"UTC", duration_minutes:30, rollback_minutes:30,
+        resources:["shared-db"],
+        windows:[{start:"2026-12-01T02:00", end:"2026-12-01T03:00", timezone:"UTC"}]}
+    ],
+    dependencies: [{upstream:"a", downstream:"b", gap_minutes:0}],
+    service_teams: [], team_blackouts: [],
+    freezes: [{label:"冻结覆盖整窗", start:"2026-12-01T00:00", end:"2026-12-01T12:00", timezone:"UTC"}]
+  }
+};
+
+function loadScenario(name){
+  document.getElementById('payload').value = JSON.stringify(SCENARIOS[name], null, 2);
+  document.getElementById('result').innerHTML = '<p class="muted">已载入，点击「生成排程」。</p>';
+}
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function submit(){
+  const box = document.getElementById('result');
+  box.innerHTML = '<p class="spin">求解中…</p>';
+  let body;
+  try { body = JSON.parse(document.getElementById('payload').value); }
+  catch(e){ box.innerHTML = `<div class="banner err">JSON 语法错误：${esc(e.message)}</div>`; return; }
+
+  const r = await fetch('/api/schedule', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const data = await r.json();
+
+  if (r.status === 422){
+    const items = data.errors.map(e => {
+      let sug = '';
+      if (e.suggestions) sug = `<div>请明确修正为以下绝对时间之一：<ul class="sug">${e.suggestions.map(s=>`<li>${esc(s)}</li>`).join('')}</ul></div>`;
+      return `<div class="inerr"><span class="code">${esc(e.code)} · ${esc(e.field||'')}</span><div>${esc(e.message)}</div>${sug}</div>`;
+    }).join('');
+    box.innerHTML = `<div class="banner err">输入校验未通过（${data.errors.length} 项），已阻止求解。夏令时重复/不存在的本地时间必须先修正。</div>${items}`;
+    return;
+  }
+
+  if (data.feasible){
+    const rows = data.schedule.map((it,i)=>`
+      <tr>
+        <td>${i+1}</td>
+        <td><b>${esc(it.name)}</b><br><span class="muted mono">${esc(it.service_id)}</span></td>
+        <td class="mono">${esc(it.deploy_start_utc)}<br><span class="muted">→ ${esc(it.deploy_end_utc)}</span></td>
+        <td class="mono">${esc(it.local_time)}<br><span class="muted">${esc(it.timezone)}</span></td>
+        <td class="mono">${esc(it.occupied_until_utc)}</td>
+        <td>${it.resources.map(r=>`<span class="tag">${esc(r)}</span>`).join('')||'<span class="muted">—</span>'}</td>
+        <td class="mono muted">${esc(it.window_used)}</td>
+      </tr>`).join('');
+    box.innerHTML = `
+      <div class="banner ok">✓ 找到${data.status==='optimal'?'最优':'可行'}排程，共 ${data.schedule.length} 个服务，全部约束均满足（UTC 时刻按开始时间排序）。</div>
+      <table><thead><tr><th>#</th><th>服务</th><th>部署开始 (UTC)</th><th>本地时间</th><th>占用至 (含回滚)</th><th>资源</th><th>命中窗口</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } else {
+    const bl = (data.blockers||[]).map(b=>`<div class="blocker"><span class="code">${esc(b.code)}</span>${esc(b.message)}</div>`).join('');
+    box.innerHTML = `
+      <div class="banner fail">✗ 不存在满足全部约束的排程（未给出任何部分结果）。以下约束组合联合起来即构成阻塞，放松/修改其中任一项后重新求解：</div>
+      ${bl || '<p class="muted">求解器未能给出具体核。</p>'}`;
+  }
+}
+
+loadScenario('basic');
+</script>
+</body>
+</html>
